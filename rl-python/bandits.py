@@ -1,3 +1,6 @@
+import abc
+from concurrent.futures import ProcessPoolExecutor
+import dataclasses as dc
 import typing as t
 
 import numpy as np
@@ -34,24 +37,34 @@ class Bandit:
         return self._rng.random() < self._p
 
 
-class GangOfBandits:
-    def __init__(self,
-                 p_actuals: t.List[float],
-                 p_estimates: t.Optional[t.List[float]] = None,
-                 rng: np.random.Generator = None,
-                 seed: int = None) -> None:
-        self._rng = utils.get_rng_if_needed(rng, seed)
-        self._p_actuals = p_actuals
-        self._n_bandits = len(p_actuals)
+@dc.dataclass(frozen=True)
+class GangOfBanditsInputs:
+    p_actuals: t.List[float]
+    n_bandits: int = dc.field(init=False)
+    p_estimates: t.Optional[t.List[float]] = None
+    rng: np.random.Generator = None
+    seed: int = None
 
-        assert (p_estimates is None) or (len(p_estimates) == self._n_bandits)
-        self._p_initial_estimate = p_estimates
+    def __post_init__(self):
+        object.__setattr__(self, 'n_bandits', len(self.p_actuals))
+        assert (self.p_estimates is None) or (len(self.p_estimates) == self.n_bandits)
+
+
+class GangOfBandits:
+    def __init__(self, args: GangOfBanditsInputs) -> None:
+        self._store_params(args)
 
         self._bandits: np.ndarray[Bandit] = self._create_bandits()
         self._best_bandit: t.Set[int] = self._get_best_bandits()
 
         self._p_estimates: np.ndarray[float] = self._initialize_p_estimates()
         self._bandit_draws: np.ndarray[int] = np.zeros(self._n_bandits)
+
+    def _store_params(self, args: GangOfBanditsInputs) -> None:
+        self._rng = utils.get_rng_if_needed(args.rng, args.seed)
+        self._p_actuals = args.p_actuals
+        self._n_bandits = args.n_bandits
+        self._p_initial_estimate = args.p_estimates
 
     def _create_bandits(self) -> np.ndarray[Bandit]:
         return np.array([Bandit(p, self._rng) for p in self._p_actuals])
@@ -109,3 +122,102 @@ class GangOfBandits:
         bandit_chosen = self._rng.choice(bandits_with_best_score)[0]
         bandit_is_best, reward = self._play_bandit_and_update_tallies(bandit_chosen)
         return bandit_chosen, bandit_is_best, reward
+
+
+class AbstractIfRandomPicker(abc.ABC):
+    @abc.abstractmethod
+    def should_play_random(self) -> bool:
+        pass
+
+
+class BanditGames:
+    def __init__(self, gob_args: GangOfBanditsInputs, rounds: int, games: int):
+        self._gob_args = gob_args
+        self._rounds = rounds
+        self._games = games
+
+    def play_game(self, strategy: AbstractIfRandomPicker) -> t.Dict[str, np.ndarray]:
+        gang_of_bandits = GangOfBandits(self._gob_args)
+        record = {
+            'bandit_chosen': np.zeros(self._rounds),
+            'bandit_is_best': np.zeros(self._rounds),
+            'reward_given': np.zeros(self._rounds)
+        }
+
+        for _round in range(self._rounds):
+            if strategy.should_play_random():
+                self._record_round_results(record, _round, gang_of_bandits.play_random_bandit())
+            else:
+                self._record_round_results(record, _round, gang_of_bandits.play_current_best_bandit())
+
+        return record
+
+    @staticmethod
+    def _record_round_results(record: t.Dict[str, np.ndarray[int]], _round: int, results: t.Tuple[int, bool, bool]) -> None:
+        chosen, is_best, reward = results
+        record['bandit_chosen'][_round] = chosen
+        record['bandit_is_best'][_round] = is_best
+        record['reward_given'][_round] = reward
+
+    def play_season(self, strategy_class: t.Type[AbstractIfRandomPicker], **strategy_args: t.Dict[str, t.Any]) -> t.Dict[str, np.ndarray]:
+        record = {
+            'best_chosen_record': [],
+            'earnings_record': []
+        }
+
+        for game in range(self._games):
+            strategy = strategy_class(**strategy_args)
+            self._record_game_results(record, self.play_game(strategy))
+
+        record = {k: np.stack(v) for k, v in record.items()}
+        return record
+
+    def _record_game_results(self, record: t.Dict[str, t.List[np.ndarray]], results: t.Dict[str, np.ndarray]) -> None:
+        record['best_chosen_record'].append(results['bandit_is_best'])
+        record['earnings_record'].append(results['reward_given'])
+
+    def play_season_parallel(self,
+                             strategy_class: t.Type[AbstractIfRandomPicker],
+                             **strategy_args: t.Dict[str, t.Any]
+                             ) -> t.Dict[str, np.ndarray]:
+        record = {
+            'best_chosen_record': [],
+            'earnings_record': []
+        }
+
+        with ProcessPoolExecutor() as executor:
+            results = executor.map(self.play_game, [strategy_class(**strategy_args) for _ in range(self._games)])
+            for result in results:
+                self._record_game_results(record, result)
+
+        record = {k: np.stack(v) for k, v in record.items()}
+        return record
+
+
+class Greedy(AbstractIfRandomPicker):
+    def should_play_random(self) -> bool:
+        return False
+
+
+class EpsilonGreedy(AbstractIfRandomPicker):
+    def __init__(self, epsilon: float, rng: t.Optional[np.random.Generator] = None, seed: t.Optional[int] = None):
+        self._p = epsilon
+        self._rng = utils.get_rng_if_needed(rng, seed)
+
+    def should_play_random(self) -> bool:
+        return self._rng.random() < self._p
+
+class ExponentialDecayEpsilonGreedy(AbstractIfRandomPicker):
+    def __init__(self, epsilon_0: float, alpha: float, rng: t.Optional[np.random.Generator] = None, seed: t.Optional[int] = None):
+        self._rng = utils.get_rng_if_needed(rng, seed)
+
+        self._epsilon_0 = epsilon_0
+        assert 0 <= alpha <= 1
+        self._alpha = alpha
+
+        self._t = -1
+
+    def should_play_random(self) -> bool:
+        self._t += 1
+        epsilon = self._epsilon_0 * (self._alpha ** self._t)
+        return self._rng.random() < epsilon
