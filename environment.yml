@@ -1,0 +1,19 @@
+name: udemy-rl
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - scipy
+  - scikit-learn
+  - seaborn
+  - tensorflow-gpu
+  - jedi[version='<0.18.0']
+  - theano
+  - mkl
+  - jupyterlab
+  - bottleneck
+  - pandas
+  - matplotlib
+  - numexpr
+  - black
+prefix: /home/koman/miniconda3/envs/udemy-rl

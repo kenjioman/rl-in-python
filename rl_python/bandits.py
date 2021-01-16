@@ -63,17 +63,17 @@ class GangOfBandits:
         self._bandits: np.ndarray[Bandit] = self._create_bandits()
         self._best_bandit: t.Set[int] = self._get_best_bandits()
 
-        self._p_estimates: np.ndarray[float] = self._initialize_p_estimates()
-        self._bandit_draws: np.ndarray[int] = (
-            np.zeros(self._n_bandits)
+        self.p_estimates: np.ndarray[float] = self._initialize_p_estimates()
+        self._bandit_draw_count: np.ndarray[int] = (
+            np.zeros(self.n_bandits)
             if args.p_estimates is None
-            else np.ones(self._n_bandits)
+            else np.ones(self.n_bandits)
         )
 
     def _store_params(self, args: GangOfBanditsInputs) -> None:
         self._rng = utils.get_rng_if_needed(args.rng, args.seed)
         self._p_actuals = args.p_actuals
-        self._n_bandits = args.n_bandits
+        self.n_bandits = args.n_bandits
         self._p_initial_estimate = args.p_estimates
 
     def _create_bandits(self) -> "np.ndarray[Bandit]":
@@ -89,14 +89,37 @@ class GangOfBandits:
 
     def _initialize_p_estimates(self) -> "np.ndarray[float]":
         return (
-            np.zeros(self._n_bandits)
+            np.zeros(self.n_bandits)
             if self._p_initial_estimate is None
             else np.array(self._p_initial_estimate, dtype=float)
         )
 
-    def play_random_bandit(self) -> t.Tuple[int, bool, bool]:
+    def play_bandit(self, bandit_chosen: int) -> t.Tuple[bool, bool]:
+        bandit_is_best = bandit_chosen in self._best_bandit
+        reward = self._bandits[bandit_chosen].pull()
+        self._update_draws_and_estimates_for_bandit(bandit_chosen, reward)
+        return bandit_is_best, reward
+
+    def _update_draws_and_estimates_for_bandit(
+        self, bandit_i: int, reward: bool
+    ) -> None:
+        self._bandit_draw_count[bandit_i] += 1
+        self.p_estimates[bandit_i] += (
+            reward - self.p_estimates[bandit_i]
+        ) / self._bandit_draw_count[bandit_i]
+
+
+class AbstractStrategy(abc.ABC):
+    def __init__(self, rng: np.random.Generator = None):
+        self._rng = utils.get_rng_if_needed(rng, seed=None)
+
+    @abc.abstractmethod
+    def play_strategy(self, gob: GangOfBandits) -> t.Tuple[int, bool, bool]:
+        raise NotImplementedError
+
+    def play_random_bandit(self, gob: GangOfBandits) -> t.Tuple[int, bool, bool]:
         """
-        Randomly choose a bandit to play from the list of available bandits,
+        Randomly choose a bandit to play from the available bandits,
         based on a simple uniform distribution
 
         Returns:
@@ -106,61 +129,19 @@ class GangOfBandits:
             reward: True/False for if a reward was given
         """
 
-        bandit_chosen = self._rng.integers(self._n_bandits)
-        bandit_is_best, reward = self._play_bandit_and_update_tallies(bandit_chosen)
+        bandit_chosen = self._rng.integers(gob.n_bandits)
+        bandit_is_best, reward = gob.play_bandit(bandit_chosen)
         return bandit_chosen, bandit_is_best, reward
-
-    def _play_bandit_and_update_tallies(
-        self, bandit_chosen: int
-    ) -> t.Tuple[bool, bool]:
-        bandit_is_best = bandit_chosen in self._best_bandit
-        reward = self._bandits[bandit_chosen].pull()
-        self._update_draws_and_estimates_for_bandit(bandit_chosen, reward)
-        return bandit_is_best, reward
-
-    def _update_draws_and_estimates_for_bandit(
-        self, bandit_i: int, reward: bool
-    ) -> None:
-        self._bandit_draws[bandit_i] += 1
-        self._p_estimates[bandit_i] += (
-            reward - self._p_estimates[bandit_i]
-        ) / self._bandit_draws[bandit_i]
-
-    def play_current_best_bandit(self) -> t.Tuple[int, bool, bool]:
-        """
-        Based on the current estimates of bandit success probabilities, choose
-        the best bandit to play
-
-        Returns:
-            bandit_chosen: The index of the bandit chosen
-            bandit_is_best: True/False for if the chosen bandit has the highest
-                actual success probability
-            reward: True/False for if a reward was given
-        """
-        current_best_score = np.amax(self._p_estimates)
-        bandits_with_best_score = np.argwhere(self._p_estimates == current_best_score)
-        bandit_chosen = self._rng.choice(bandits_with_best_score)[0]
-        bandit_is_best, reward = self._play_bandit_and_update_tallies(bandit_chosen)
-        return bandit_chosen, bandit_is_best, reward
-
-
-class AbstractIfRandomPicker(abc.ABC):
-    def __init__(self, rng=None):
-        self.rng = utils.get_rng_if_needed(rng, seed=None)
-
-    @abc.abstractmethod
-    def should_play_random(self) -> bool:
-        pass
 
 
 @dc.dataclass
 class StrategyWrapper:
-    strategy_class: t.Type[AbstractIfRandomPicker]
+    strategy_class: t.Type[AbstractStrategy]
     strategy_args: t.Dict[str, t.Any]
 
 
 @dc.dataclass
-class SeasonResults:
+class ReplicateResults:
     _best_chosen: t.List = dc.field(default_factory=list, init=False)
     _earnings: t.List = dc.field(default_factory=list, init=False)
 
@@ -188,13 +169,15 @@ class SeasonResults:
         return self._earnings_record
 
 
-class BanditGames:
-    def __init__(self, gob_args: GangOfBanditsInputs, rounds: int, games: int) -> None:
+class BanditExperiments:
+    def __init__(
+        self, gob_args: GangOfBanditsInputs, iterations: int, replicates: int
+    ) -> None:
         self._rng = utils.get_rng_if_needed(gob_args.rng, gob_args.seed)
         _gob_args = self._update_gang_of_bandit_inputs_with_rng(gob_args, self._rng)
         self._gob_args = _gob_args
-        self._rounds = rounds
-        self._games = games
+        self._iterations = iterations
+        self._replicates = replicates
 
     @staticmethod
     def _update_gang_of_bandit_inputs_with_rng(
@@ -204,8 +187,8 @@ class BanditGames:
         new_args.pop("n_bandits", None)
         return GangOfBanditsInputs(**new_args)
 
-    def play_game(
-        self, strategy: AbstractIfRandomPicker, rng: np.random.Generator = None
+    def run_iterations(
+        self, strategy: AbstractStrategy, rng: np.random.Generator = None
     ) -> t.Dict[str, np.ndarray]:
         if rng is not None:
             _gob_args = self._update_gang_of_bandit_inputs_with_rng(self._gob_args, rng)
@@ -213,25 +196,20 @@ class BanditGames:
             _gob_args = self._gob_args
         gang_of_bandits = GangOfBandits(_gob_args)
         record = {
-            "bandit_chosen": np.zeros(self._rounds),
-            "bandit_is_best": np.zeros(self._rounds),
-            "reward_given": np.zeros(self._rounds),
+            "bandit_chosen": np.zeros(self._iterations),
+            "bandit_is_best": np.zeros(self._iterations),
+            "reward_given": np.zeros(self._iterations),
         }
 
-        for _round in range(self._rounds):
-            if strategy.should_play_random():
-                self._record_round_results(
-                    record, _round, gang_of_bandits.play_random_bandit()
-                )
-            else:
-                self._record_round_results(
-                    record, _round, gang_of_bandits.play_current_best_bandit()
-                )
+        for i in range(self._iterations):
+            self._record_iteration_results(
+                record, i, strategy.play_strategy(gang_of_bandits)
+            )
 
         return record
 
     @staticmethod
-    def _record_round_results(
+    def _record_iteration_results(
         record: t.Dict[str, "np.ndarray[int]"],
         _round: int,
         results: t.Tuple[int, bool, bool],
@@ -241,34 +219,37 @@ class BanditGames:
         record["bandit_is_best"][_round] = is_best
         record["reward_given"][_round] = reward
 
-    def play_season(self, strategy_wrapper: StrategyWrapper) -> SeasonResults:
+    def run_replicates(self, strategy_wrapper: StrategyWrapper) -> ReplicateResults:
         if "rng" in inspect.signature(strategy_wrapper.strategy_class).parameters:
             strategy_args = {**strategy_wrapper.strategy_args, "rng": self._rng}
         else:
             strategy_args = strategy_wrapper.strategy_args
 
-        record = SeasonResults()
+        record = ReplicateResults()
 
-        for game in range(self._games):
+        for replicate in range(self._replicates):
             strategy = strategy_wrapper.strategy_class(**strategy_args)
-            self._record_game_results(record, self.play_game(strategy))
+            self._record_replicate_results(record, self.run_iterations(strategy))
 
         return record
 
-    def _record_game_results(
-        self, record: SeasonResults, results: t.Dict[str, np.ndarray]
+    @staticmethod
+    def _record_replicate_results(
+        record: ReplicateResults, results: t.Dict[str, np.ndarray]
     ) -> None:
         record.add_best_chosen(results["bandit_is_best"])
         record.add_earnings(results["reward_given"])
 
-    def play_season_parallel(self, strategy_wrapper: StrategyWrapper) -> SeasonResults:
-        record = SeasonResults()
+    def run_replicates_parallel(
+        self, strategy_wrapper: StrategyWrapper
+    ) -> ReplicateResults:
+        record = ReplicateResults()
 
         # To get good parallel RNG results, need to do some special magic. See:
         # https://numpy.org/doc/stable/reference/random/parallel.html
         # https://albertcthomas.github.io/good-practices-random-number-generators/
         seed_sequence: np.random.SeedSequence = self._rng.bit_generator._seed_seq
-        child_states = seed_sequence.spawn(self._games)
+        child_states = seed_sequence.spawn(self._replicates)
         rngs = [utils.get_rng_if_needed(seed=s) for s in child_states]
         if "rng" in inspect.signature(strategy_wrapper.strategy_class).parameters:
             strategies = [
@@ -280,42 +261,63 @@ class BanditGames:
         else:
             strategies = [
                 strategy_wrapper.strategy_class(**strategy_wrapper.strategy_args)
-                for _ in range(self._games)
+                for _ in range(self._replicates)
             ]
 
         with ProcessPoolExecutor() as executor:
-            results = executor.map(self.play_game, strategies, rngs)
+            results = executor.map(self.run_iterations, strategies, rngs)
             for result in results:
-                self._record_game_results(record, result)
+                self._record_replicate_results(record, result)
 
         return record
 
 
-class Greedy(AbstractIfRandomPicker):
-    def __init__(self):
-        pass
+class Greedy(AbstractStrategy):
+    def __init__(self, rng: t.Optional[np.random.Generator] = None):
+        super().__init__(rng)
 
-    def should_play_random(self) -> bool:
-        return False
+    def play_strategy(self, gob: GangOfBandits) -> t.Tuple[int, bool, bool]:
+        return self.play_random_bandit(gob)
 
 
-class EpsilonGreedy(AbstractIfRandomPicker):
+class EpsilonGreedy(AbstractStrategy):
     def __init__(self, epsilon: float, rng: t.Optional[np.random.Generator] = None):
         super().__init__(rng)
         self._p = epsilon
 
-    def should_play_random(self) -> bool:
-        return self._rng.random() < self._p
+    def play_strategy(self, gob: GangOfBandits) -> t.Tuple[int, bool, bool]:
+        should_play_random_bandit = self._rng.random() < self._p
+        if should_play_random_bandit:
+            return self.play_random_bandit(gob)
+        else:
+            return self.play_current_best_bandit(gob)
+
+    def play_current_best_bandit(self, gob: GangOfBandits) -> t.Tuple[int, bool, bool]:
+        """
+        Based on the current estimates of bandit success probabilities, choose
+        the best bandit to play
+
+        Returns:
+            bandit_chosen: The index of the bandit chosen
+            bandit_is_best: True/False for if the chosen bandit has the highest
+                actual success probability
+            reward: True/False for if a reward was given
+        """
+        current_best_score = np.amax(gob.p_estimates)
+        bandits_with_best_score = np.argwhere(gob.p_estimates == current_best_score)
+        bandit_chosen = self._rng.choice(bandits_with_best_score)[0]
+        bandit_is_best, reward = gob.play_bandit(bandit_chosen)
+        return bandit_chosen, bandit_is_best, reward
 
 
-class ExponentialDecayEpsilonGreedy(AbstractIfRandomPicker):
+class ExponentialDecayEpsilonGreedy(EpsilonGreedy):
     def __init__(
         self,
         epsilon_0: float,
         alpha: float,
         rng: t.Optional[np.random.Generator] = None,
     ):
-        super().__init__(rng)
+        super().__init__(epsilon_0, rng)
 
         self._epsilon_0 = epsilon_0
         assert 0 <= alpha <= 1
@@ -323,14 +325,16 @@ class ExponentialDecayEpsilonGreedy(AbstractIfRandomPicker):
 
         self._t = -1
 
-    def should_play_random(self) -> bool:
+    def play_strategy(self, gob: GangOfBandits) -> t.Tuple[int, bool, bool]:
         self._t += 1
-        epsilon = self._epsilon_0 * (self._alpha ** self._t)
-        return self._rng.random() < epsilon
+        self._p = self._epsilon_0 * (self._alpha ** self._t)
+        return super().play_strategy(gob)
 
 
 def plot_p_best_bandit_chosen_vs_rounds_in_game(
-    results: t.List[SeasonResults], labels: t.List[str], **plot_args: t.Dict[str, t.Any]
+    results: t.List[ReplicateResults],
+    labels: t.List[str],
+    **plot_args: t.Dict[str, t.Any]
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -338,8 +342,8 @@ def plot_p_best_bandit_chosen_vs_rounds_in_game(
     for result, label in zip(results, labels):
         plt.plot(np.mean(result.best_chosen_record, axis=0), label=label)
 
-    plt.title("Probability best bandit was chosen over rounds in a game")
-    plt.xlabel("Rounds")
+    plt.title("Probability best bandit was chosen over iterations in a replicate")
+    plt.xlabel("Iterations")
     plt.ylabel("Probability of Optimal Action")
     plt.ylim((0, 1))
     plt.grid(which="major")
